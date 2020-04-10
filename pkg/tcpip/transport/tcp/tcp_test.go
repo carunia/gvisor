@@ -2665,11 +2665,9 @@ func TestSynCookiePassiveSendMSSLessThanMTU(t *testing.T) {
 
 	// Set the SynRcvd threshold to zero to force a syn cookie based accept
 	// to happen.
-	saved := tcp.SynRcvdCountThreshold
-	defer func() {
-		tcp.SynRcvdCountThreshold = saved
-	}()
-	tcp.SynRcvdCountThreshold = 0
+	if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, tcpip.TCPSynRcvdCountThresholdOption(0)); err != nil {
+		t.Fatalf("setting TCPSynRcvdCountThresholdOption to 0 failed: %v", err)
+	}
 
 	// Create EP and start listening.
 	wq := &waiter.Queue{}
@@ -5102,14 +5100,12 @@ func TestListenSynRcvdQueueFull(t *testing.T) {
 }
 
 func TestListenBacklogFullSynCookieInUse(t *testing.T) {
-	saved := tcp.SynRcvdCountThreshold
-	defer func() {
-		tcp.SynRcvdCountThreshold = saved
-	}()
-	tcp.SynRcvdCountThreshold = 1
-
 	c := context.New(t, defaultMTU)
 	defer c.Cleanup()
+
+	if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, tcpip.TCPSynRcvdCountThresholdOption(1)); err != nil {
+		t.Fatalf("setting TCPSynRcvdCountThresholdOption to 1 failed: %v", err)
+	}
 
 	// Create TCP endpoint.
 	var err *tcpip.Error
