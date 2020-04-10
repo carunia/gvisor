@@ -64,6 +64,9 @@ type Layer interface {
 
 	// setPrev sets the pointer to the Layer encapsulating this one.
 	setPrev(Layer)
+
+	// merge overrides the values in the interface with the provided values.
+	merge(Layer) error
 }
 
 // LayerBase is the common elements of all layers.
@@ -91,6 +94,9 @@ func (lb *LayerBase) setPrev(l Layer) {
 // equalLayer compares that two Layer structs match while ignoring field in
 // which either input has a nil and also ignoring the LayerBase of the inputs.
 func equalLayer(x, y Layer) bool {
+	if x == nil || y == nil {
+		return true
+	}
 	// opt ignores comparison pairs where either of the inputs is a nil.
 	opt := cmp.FilterValues(func(x, y interface{}) bool {
 		for _, l := range []interface{}{x, y} {
@@ -102,6 +108,15 @@ func equalLayer(x, y Layer) bool {
 		return false
 	}, cmp.Ignore())
 	return cmp.Equal(x, y, opt, cmpopts.IgnoreTypes(LayerBase{}))
+}
+
+// mergeLayer merges other in layer. Any non-nil value in other overrides the
+// corresponding value in layer. If other is nil, no action is performed.
+func mergeLayer(layer, other Layer) error {
+	if other == nil {
+		return nil
+	}
+	return mergo.Merge(layer, other, mergo.WithOverride)
 }
 
 func stringLayer(l Layer) string {
@@ -172,27 +187,46 @@ func NetworkProtocolNumber(v tcpip.NetworkProtocolNumber) *tcpip.NetworkProtocol
 	return &v
 }
 
+// LayerParser parses the input bytes and returns a Layer along with the next
+// LayerParser to run. If there is no more parsing to do, the returned
+// LayerParser is nil.
+type LayerParser func([]byte) (Layer, LayerParser)
+
+// Parse parses bytes starting with the first LayerParser and using successive
+// LayerParsers until all the bytes are parsed.
+func Parse(parser LayerParser, b []byte) Layers {
+	var layers Layers
+	for {
+		var layer Layer
+		layer, parser = parser(b)
+		layers = append(layers, layer)
+		if parser == nil {
+			break
+		}
+		b = b[layer.length():]
+	}
+	layers.linkLayers()
+	return layers
+}
+
 // ParseEther parses the bytes assuming that they start with an ethernet header
 // and continues parsing further encapsulations.
-func ParseEther(b []byte) (Layers, error) {
+func ParseEther(b []byte) (Layer, LayerParser) {
 	h := header.Ethernet(b)
 	ether := Ether{
 		SrcAddr: LinkAddress(h.SourceAddress()),
 		DstAddr: LinkAddress(h.DestinationAddress()),
 		Type:    NetworkProtocolNumber(h.Type()),
 	}
-	layers := Layers{&ether}
+	var nextParser LayerParser
 	switch h.Type() {
 	case header.IPv4ProtocolNumber:
-		moreLayers, err := ParseIPv4(b[ether.length():])
-		if err != nil {
-			return nil, err
-		}
-		return append(layers, moreLayers...), nil
+		nextParser = ParseIPv4
 	default:
-		// TODO(b/150301488): Support more protocols, like IPv6.
-		return nil, fmt.Errorf("ethernet header's type field is unrecognized: %#04x", h.Type())
+		// Assume that the rest is a payload.
+		nextParser = ParsePayload
 	}
+	return &ether, nextParser
 }
 
 func (l *Ether) match(other Layer) bool {
@@ -201,6 +235,12 @@ func (l *Ether) match(other Layer) bool {
 
 func (l *Ether) length() int {
 	return header.EthernetMinimumSize
+}
+
+// merge overrides the values in l with the values from other but only in fields
+// where the value is not nil.
+func (l *Ether) merge(other Layer) error {
+	return mergeLayer(l, other)
 }
 
 // IPv4 can construct and match an IPv4 encapsulation.
@@ -313,7 +353,7 @@ func Address(v tcpip.Address) *tcpip.Address {
 
 // ParseIPv4 parses the bytes assuming that they start with an ipv4 header and
 // continues parsing further encapsulations.
-func ParseIPv4(b []byte) (Layers, error) {
+func ParseIPv4(b []byte) (Layer, LayerParser) {
 	h := header.IPv4(b)
 	tos, _ := h.TOS()
 	ipv4 := IPv4{
@@ -329,22 +369,17 @@ func ParseIPv4(b []byte) (Layers, error) {
 		SrcAddr:        Address(h.SourceAddress()),
 		DstAddr:        Address(h.DestinationAddress()),
 	}
-	layers := Layers{&ipv4}
+	var nextParser LayerParser
 	switch h.TransportProtocol() {
 	case header.TCPProtocolNumber:
-		moreLayers, err := ParseTCP(b[ipv4.length():])
-		if err != nil {
-			return nil, err
-		}
-		return append(layers, moreLayers...), nil
+		nextParser = ParseTCP
 	case header.UDPProtocolNumber:
-		moreLayers, err := ParseUDP(b[ipv4.length():])
-		if err != nil {
-			return nil, err
-		}
-		return append(layers, moreLayers...), nil
+		nextParser = ParseUDP
+	default:
+		// Assume that the rest is a payload.
+		nextParser = ParsePayload
 	}
-	return nil, fmt.Errorf("ipv4 header's protocol field is unrecognized: %#02x", h.Protocol())
+	return &ipv4, nextParser
 }
 
 func (l *IPv4) match(other Layer) bool {
@@ -356,6 +391,12 @@ func (l *IPv4) length() int {
 		return header.IPv4MinimumSize
 	}
 	return int(*l.IHL)
+}
+
+// merge overrides the values in l with the values from other but only in fields
+// where the value is not nil.
+func (l *IPv4) merge(other Layer) error {
+	return mergeLayer(l, other)
 }
 
 // TCP can construct and match a TCP encapsulation.
@@ -470,7 +511,7 @@ func Uint32(v uint32) *uint32 {
 
 // ParseTCP parses the bytes assuming that they start with a tcp header and
 // continues parsing further encapsulations.
-func ParseTCP(b []byte) (Layers, error) {
+func ParseTCP(b []byte) (Layer, LayerParser) {
 	h := header.TCP(b)
 	tcp := TCP{
 		SrcPort:       Uint16(h.SourcePort()),
@@ -483,12 +524,7 @@ func ParseTCP(b []byte) (Layers, error) {
 		Checksum:      Uint16(h.Checksum()),
 		UrgentPointer: Uint16(h.UrgentPointer()),
 	}
-	layers := Layers{&tcp}
-	moreLayers, err := ParsePayload(b[tcp.length():])
-	if err != nil {
-		return nil, err
-	}
-	return append(layers, moreLayers...), nil
+	return &tcp, ParsePayload
 }
 
 func (l *TCP) match(other Layer) bool {
@@ -504,8 +540,8 @@ func (l *TCP) length() int {
 
 // merge overrides the values in l with the values from other but only in fields
 // where the value is not nil.
-func (l *TCP) merge(other TCP) error {
-	return mergo.Merge(l, other, mergo.WithOverride)
+func (l *TCP) merge(other Layer) error {
+	return mergeLayer(l, other)
 }
 
 // UDP can construct and match a UDP encapsulation.
@@ -557,8 +593,8 @@ func setUDPChecksum(h *header.UDP, udp *UDP) error {
 }
 
 // ParseUDP parses the bytes assuming that they start with a udp header and
-// continues parsing further encapsulations.
-func ParseUDP(b []byte) (Layers, error) {
+// returns the parsed layer and the next parser to use.
+func ParseUDP(b []byte) (Layer, LayerParser) {
 	h := header.UDP(b)
 	udp := UDP{
 		SrcPort:  Uint16(h.SourcePort()),
@@ -566,12 +602,7 @@ func ParseUDP(b []byte) (Layers, error) {
 		Length:   Uint16(h.Length()),
 		Checksum: Uint16(h.Checksum()),
 	}
-	layers := Layers{&udp}
-	moreLayers, err := ParsePayload(b[udp.length():])
-	if err != nil {
-		return nil, err
-	}
-	return append(layers, moreLayers...), nil
+	return &udp, ParsePayload
 }
 
 func (l *UDP) match(other Layer) bool {
@@ -587,8 +618,8 @@ func (l *UDP) length() int {
 
 // merge overrides the values in l with the values from other but only in fields
 // where the value is not nil.
-func (l *UDP) merge(other UDP) error {
-	return mergo.Merge(l, other, mergo.WithOverride)
+func (l *UDP) merge(other Layer) error {
+	return mergeLayer(l, other)
 }
 
 // Payload has bytes beyond OSI layer 4.
@@ -603,11 +634,11 @@ func (l *Payload) String() string {
 
 // ParsePayload parses the bytes assuming that they start with a payload and
 // continue to the end. There can be no further encapsulations.
-func ParsePayload(b []byte) (Layers, error) {
+func ParsePayload(b []byte) (Layer, LayerParser) {
 	payload := Payload{
 		Bytes: b,
 	}
-	return Layers{&payload}, nil
+	return &payload, nil
 }
 
 func (l *Payload) toBytes() ([]byte, error) {
@@ -622,18 +653,33 @@ func (l *Payload) length() int {
 	return len(l.Bytes)
 }
 
+// merge overrides the values in l with the values from other but only in fields
+// where the value is not nil.
+func (l *Payload) merge(other Layer) error {
+	return mergeLayer(l, other)
+}
+
 // Layers is an array of Layer and supports similar functions to Layer.
 type Layers []Layer
 
-func (ls *Layers) toBytes() ([]byte, error) {
+// linkLayers sets the linked-list ponters in ls.
+func (ls *Layers) linkLayers() {
 	for i, l := range *ls {
 		if i > 0 {
 			l.setPrev((*ls)[i-1])
+		} else {
+			l.setPrev(nil)
 		}
 		if i+1 < len(*ls) {
 			l.setNext((*ls)[i+1])
+		} else {
+			l.setNext(nil)
 		}
 	}
+}
+
+func (ls *Layers) toBytes() ([]byte, error) {
+	ls.linkLayers()
 	outBytes := []byte{}
 	for _, l := range *ls {
 		layerBytes, err := l.toBytes()
@@ -649,8 +695,8 @@ func (ls *Layers) match(other Layers) bool {
 	if len(*ls) > len(other) {
 		return false
 	}
-	for i := 0; i < len(*ls); i++ {
-		if !equalLayer((*ls)[i], other[i]) {
+	for i, l := range *ls {
+		if !equalLayer(l, other[i]) {
 			return false
 		}
 	}
