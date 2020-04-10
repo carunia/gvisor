@@ -118,6 +118,21 @@ TEST_F(Pread64Test, EndOfFile) {
   EXPECT_THAT(pread64(fd.get(), buf, 1024, 0), SyscallSucceedsWithValue(0));
 }
 
+int memfd_create(const std::string& name, unsigned int flags) {
+  return syscall(__NR_memfd_create, name.c_str(), flags);
+}
+
+TEST_F(Pread64Test, Overflow) {
+  int f = memfd_create("negative", 0);
+  const FileDescriptor fd(f);
+
+  EXPECT_THAT(ftruncate(fd.get(), 0x7fffffffffffffffull), SyscallSucceeds());
+
+  char buf[10];
+  EXPECT_THAT(pread64(fd.get(), buf, sizeof(buf), 0x7fffffffffffffffull),
+              SyscallFailsWithErrno(EINVAL));
+}
+
 TEST(Pread64TestNoTempFile, CantReadSocketPair_NoRandomSave) {
   int sock_fds[2];
   EXPECT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds), SyscallSucceeds());
