@@ -15,6 +15,7 @@
 package testbench
 
 import (
+	"encoding/hex"
 	"fmt"
 	"reflect"
 	"strings"
@@ -64,6 +65,9 @@ type Layer interface {
 
 	// setPrev sets the pointer to the Layer encapsulating this one.
 	setPrev(Layer)
+
+	// merge overrides the values in the interface with the provided values.
+	merge(Layer) error
 }
 
 // LayerBase is the common elements of all layers.
@@ -91,6 +95,9 @@ func (lb *LayerBase) setPrev(l Layer) {
 // equalLayer compares that two Layer structs match while ignoring field in
 // which either input has a nil and also ignoring the LayerBase of the inputs.
 func equalLayer(x, y Layer) bool {
+	if x == nil || y == nil {
+		return true
+	}
 	// opt ignores comparison pairs where either of the inputs is a nil.
 	opt := cmp.FilterValues(func(x, y interface{}) bool {
 		for _, l := range []interface{}{x, y} {
@@ -118,7 +125,12 @@ func stringLayer(l Layer) string {
 		if v.IsNil() {
 			continue
 		}
-		ret = append(ret, fmt.Sprintf("%s:%v", t.Name, reflect.Indirect(v)))
+		v = reflect.Indirect(v)
+		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+			ret = append(ret, fmt.Sprintf("%s:\n%v", t.Name, hex.Dump(v.Bytes())))
+		} else {
+			ret = append(ret, fmt.Sprintf("%s:%v", t.Name, v))
+		}
 	}
 	return fmt.Sprintf("&%s{%s}", t, strings.Join(ret, " "))
 }
@@ -188,11 +200,16 @@ func ParseEther(b []byte) (Layers, error) {
 		if err != nil {
 			return nil, err
 		}
-		return append(layers, moreLayers...), nil
+		layers = append(layers, moreLayers...)
 	default:
 		// TODO(b/150301488): Support more protocols, like IPv6.
 		return nil, fmt.Errorf("ethernet header's type field is unrecognized: %#04x", h.Type())
 	}
+	if len(layers) > 1 {
+		layers[0].setNext(layers[1])
+		layers[1].setPrev(layers[0])
+	}
+	return layers, nil
 }
 
 func (l *Ether) match(other Layer) bool {
@@ -201,6 +218,12 @@ func (l *Ether) match(other Layer) bool {
 
 func (l *Ether) length() int {
 	return header.EthernetMinimumSize
+}
+
+// merge overrides the values in l with the values from other but only in fields
+// where the value is not nil.
+func (l *Ether) merge(other Layer) error {
+	return mergo.Merge(l, other, mergo.WithOverride)
 }
 
 // IPv4 can construct and match an IPv4 encapsulation.
@@ -336,15 +359,21 @@ func ParseIPv4(b []byte) (Layers, error) {
 		if err != nil {
 			return nil, err
 		}
-		return append(layers, moreLayers...), nil
+		layers = append(layers, moreLayers...)
 	case header.UDPProtocolNumber:
 		moreLayers, err := ParseUDP(b[ipv4.length():])
 		if err != nil {
 			return nil, err
 		}
-		return append(layers, moreLayers...), nil
+		layers = append(layers, moreLayers...)
+	default:
+		return nil, fmt.Errorf("ipv4 header's protocol field is unrecognized: %#02x", h.Protocol())
 	}
-	return nil, fmt.Errorf("ipv4 header's protocol field is unrecognized: %#02x", h.Protocol())
+	if len(layers) > 1 {
+		layers[0].setNext(layers[1])
+		layers[1].setPrev(layers[0])
+	}
+	return layers, nil
 }
 
 func (l *IPv4) match(other Layer) bool {
@@ -356,6 +385,12 @@ func (l *IPv4) length() int {
 		return header.IPv4MinimumSize
 	}
 	return int(*l.IHL)
+}
+
+// merge overrides the values in l with the values from other but only in fields
+// where the value is not nil.
+func (l *IPv4) merge(other Layer) error {
+	return mergo.Merge(l, other, mergo.WithOverride)
 }
 
 // TCP can construct and match a TCP encapsulation.
@@ -488,7 +523,12 @@ func ParseTCP(b []byte) (Layers, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(layers, moreLayers...), nil
+	layers = append(layers, moreLayers...)
+	if len(layers) > 1 {
+		layers[0].setNext(layers[1])
+		layers[1].setPrev(layers[0])
+	}
+	return layers, nil
 }
 
 func (l *TCP) match(other Layer) bool {
@@ -504,7 +544,7 @@ func (l *TCP) length() int {
 
 // merge overrides the values in l with the values from other but only in fields
 // where the value is not nil.
-func (l *TCP) merge(other TCP) error {
+func (l *TCP) merge(other Layer) error {
 	return mergo.Merge(l, other, mergo.WithOverride)
 }
 
@@ -571,7 +611,12 @@ func ParseUDP(b []byte) (Layers, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(layers, moreLayers...), nil
+	layers = append(layers, moreLayers...)
+	if len(layers) > 1 {
+		layers[0].setNext(layers[1])
+		layers[1].setPrev(layers[0])
+	}
+	return layers, nil
 }
 
 func (l *UDP) match(other Layer) bool {
@@ -587,7 +632,7 @@ func (l *UDP) length() int {
 
 // merge overrides the values in l with the values from other but only in fields
 // where the value is not nil.
-func (l *UDP) merge(other UDP) error {
+func (l *UDP) merge(other Layer) error {
 	return mergo.Merge(l, other, mergo.WithOverride)
 }
 
@@ -622,6 +667,12 @@ func (l *Payload) length() int {
 	return len(l.Bytes)
 }
 
+// merge overrides the values in l with the values from other but only in fields
+// where the value is not nil.
+func (l *Payload) merge(other Layer) error {
+	return mergo.Merge(l, other, mergo.WithOverride)
+}
+
 // Layers is an array of Layer and supports similar functions to Layer.
 type Layers []Layer
 
@@ -649,8 +700,8 @@ func (ls *Layers) match(other Layers) bool {
 	if len(*ls) > len(other) {
 		return false
 	}
-	for i := 0; i < len(*ls); i++ {
-		if !equalLayer((*ls)[i], other[i]) {
+	for i, this := range *ls {
+		if !equalLayer(this, other[i]) {
 			return false
 		}
 	}
